@@ -1,0 +1,96 @@
+#!/bin/bash
+## Shitty vpn startu/status script
+## License
+# The MIT License (MIT)
+#
+# Copyright (c) 2015 Chip Gwyn: chip@fludigravity.com
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+##
+
+
+OPENCONNECT=$(which openconnect)
+USER=$USER
+OPTS="-b -l --authgroup <GROUP_NAME>"
+PIDFILE='/var/run/openconnect.pid'
+HOST="<VPN_HOSTNAME>"
+
+function _get_sudo {
+	sudo -l > /dev/null 2>&1
+}
+
+function _is_running {
+	PID=$(ps axo pid,cmd,etime | grep -w "$OPENCONNECT" | head -n 1 | awk '{print $1}')
+	if [ $PID ]; then
+		IS_RUNNING=1
+	fi
+}
+
+function _status {
+	_is_running
+
+	# if IS_RUNNING is not defined, its not running
+	if [ -z $IS_RUNNING ]; then
+		echo "VPN is Stopped..."
+	else
+		echo "VPN is Running. PID: $PID"
+	fi
+}
+
+function _start {
+	echo "Starting VPN..."
+	sudo $OPENCONNECT $OPTS -u $USER --pid-file=$PIDFILE --os=linux-64 $HOST
+	_status		
+}
+
+function  _stop {
+	echo "Stopping VPN..."
+	_is_running
+	sudo kill -TERM $PID
+	sleep 2
+}
+
+
+#######################################
+# Main
+#######################################
+
+if [ -z "$1" ]; then
+	_status
+	exit
+fi
+
+if [ "$1" = "status" ]; then
+	_status
+	exit
+fi
+
+# Everything past here requires SUDO perms...
+_get_sudo
+
+# Do the thing
+if [ "$1" = "start" ]; then
+	_start
+	exit
+fi
+
+if [ "$1" = "stop" ]; then
+	_stop
+	exit
+fi
