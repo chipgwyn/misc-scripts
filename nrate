@@ -1,0 +1,484 @@
+#!/usr/bin/perl
+use strict;
+use POSIX qw(setsid);
+use Sys::Syslog qw(:DEFAULT setlogsock);
+use Getopt::Long;
+
+use constant VERSION             => "2.1";
+
+use constant INDEX_RX_BYTES      => 0;
+use constant INDEX_RX_PACKETS    => 1;
+use constant INDEX_RX_ERRORS     => 2;
+use constant INDEX_RX_DROPS      => 3;
+use constant INDEX_RX_FIFO       => 4;
+use constant INDEX_RX_FRAME      => 5;
+use constant INDEX_RX_COMPRESSED => 6;
+use constant INDEX_RX_MULTICAST  => 7;
+
+use constant INDEX_TX_BYTES      => 0;
+use constant INDEX_TX_PACKETS    => 1;
+use constant INDEX_TX_ERRORS     => 2;
+use constant INDEX_TX_DROPS      => 3;
+use constant INDEX_TX_FIFO       => 4;
+use constant INDEX_TX_COLLS      => 5;
+use constant INDEX_TX_CARRIER    => 6;
+use constant INDEX_TX_COMPRESSED => 7;
+use constant INDEX_MAX           => 7;
+
+use constant DEFAULT_INTERVAL    => 5;
+use constant DEFAULT_PIDFILE     => "/var/run/nrate/nrate.pid";
+use constant DEFAULT_WINDOW_SIZE => 1;
+
+# default threshold values
+my @thresholds_rx = qw(0 0 1 1 1 1 -1 -1);
+my @thresholds_tx = qw(0 0 1 1 1 1  1 -1);
+
+# if a given interface stat is an average or difference of the interval
+my @threshold_avg = qw(1 1 0 0 0 0 0 0);
+
+# printable units for the different threshold stats
+my @threshold_rx_units = qw(Mbps Kpps errs drops fifo frames compressed multicast);
+my @threshold_tx_units = qw(Mbps Kpps errs drops fifo collisions carrier compressed);
+
+# how a given interface stat should be modified to convert it into the
+# proper units. ie convert bytes/s to Mbps
+my @threshold_convert = qw(0.000008 0.001 1 1 1 1 1 1);
+
+# how each theshold stat should be printed
+my @threshold_formats = qw(%6.1f %6.1f %2d %2d %2d %2d %2d %2d);
+
+my $lograte;
+my $lastlog;
+my $syslog;
+my $window_size = DEFAULT_WINDOW_SIZE;
+my @stats;
+
+main();
+
+sub main {
+  my $interval = DEFAULT_INTERVAL;
+  my $pidfile = DEFAULT_PIDFILE;
+  my $daemonize;
+  my $intreg;
+  my $help;
+
+  my $result = GetOptions("intverval|t=i"   => \$interval,
+                          "interface|i=s"   => \$intreg,
+                          "syslog|s"        => \$syslog,
+                          "daemonize|D"     => \$daemonize,
+                          "window-size|w=i" => \$window_size,
+                          "log-rate|l=i"    => \$lograte,
+                          "pid-file|p=s"    => \$pidfile,
+                          "help|h"          => \$help,
+
+                          "rx-mbits=f"      => \$thresholds_rx[INDEX_RX_BYTES],
+                          "rx-kpps=f"       => \$thresholds_rx[INDEX_RX_PACKETS],
+                          "rx-errors=i"     => \$thresholds_rx[INDEX_RX_ERRORS],
+                          "rx-drops=i"      => \$thresholds_rx[INDEX_RX_DROPS],
+                          "rx-fifo=i"       => \$thresholds_rx[INDEX_RX_FIFO],
+                          "rx-frame=i"      => \$thresholds_rx[INDEX_RX_FRAME],
+                          "rx-compressed=i" => \$thresholds_rx[INDEX_RX_COMPRESSED],
+                          "rx-multicast=i"  => \$thresholds_rx[INDEX_RX_MULTICAST],
+
+                          "tx-mbits=f"      => \$thresholds_tx[INDEX_TX_BYTES],
+                          "tx-kpps=f"       => \$thresholds_tx[INDEX_TX_PACKETS],
+                          "tx-errors=i"     => \$thresholds_tx[INDEX_TX_ERRORS],
+                          "tx-drops=i"      => \$thresholds_tx[INDEX_TX_DROPS],
+                          "tx-fifo=i"       => \$thresholds_tx[INDEX_TX_FIFO],
+                          "tx-colls=i"      => \$thresholds_tx[INDEX_TX_COLLS],
+                          "tx-carrier=i"    => \$thresholds_tx[INDEX_TX_CARRIER],
+                          "tx-compressed=i" => \$thresholds_tx[INDEX_TX_COMPRESSED]);
+
+
+  if(!$result || $help) {
+    usage();
+    exit;
+  }
+
+  if(defined($daemonize) && !defined($syslog)) {
+    nprint("FATAL: --daemonize requires --syslog");
+    exit;
+  }
+
+  if($interval <= 0) {
+    nprint("FATAL: Invalid interval \"$interval\"");
+    exit;
+  }
+
+  if($interval == 1) {
+    nprint("WARN: Using an interval of 1 will give inconsistent results");
+  }
+
+  if($window_size <= 0) {
+    nprint("FATAL: Invalid window-size \"$window_size\"");
+    exit;
+  }
+
+  my $stats = get_stats();
+  window_add($stats);
+
+  if(!defined($intreg)) {
+    $intreg = guess_intreg($stats);
+  }
+
+  # test the regex
+  eval { "test" =~ /^$intreg$/ };
+  if($@) {
+    nprint("FATAL: Invalid interface regex \"$intreg\"");
+    exit;
+  }
+
+  # verify regex matches at least 1 interface
+  my $count = 0;
+  for my $int (keys %$stats) {
+    if($int =~ /^$intreg$/) {
+      $count++;
+    }
+  }
+  if($count == 0) {
+    nprint("FATAL: Interface regex \"$intreg\" doesn't match any interface names");
+    exit;
+  }
+
+  if(defined($lograte) && $lograte < 0) {
+    nprint("FATAL: Invalid --log-rate value \"$lograte\"");
+    exit;
+  }
+
+  if($daemonize) {
+    check_pid($pidfile);
+    
+    if(fork()) {
+      wait();
+      exit;
+    }
+      
+    setsid();
+    open(STDIN,  "+>/dev/null");    
+    open(STDOUT, "+>&STDIN");
+    open(STDERR, "+>&STDIN");
+
+    if(fork()) {
+       exit;
+    }
+    nprint("nrate version " . VERSION . " starting in daemon mode");
+    write_pid($pidfile);
+  }
+
+  nprint("Interface Regex: $intreg, Sample Interval: $interval seconds, Window Size: $window_size");
+  if(defined($lograte)) {
+    nprint("Log Rate Limit: 1 line per interface per $lograte seconds");
+  }
+
+  # dump the rx/tx thresholds
+  my (@rxdump, @txdump);
+  for(my $count; $count <= INDEX_MAX; $count++) {
+    if($thresholds_rx[$count] >= 0) {
+      push(@rxdump, $threshold_rx_units[$count] . " >= " . $thresholds_rx[$count]);
+    }
+    if($thresholds_tx[$count] >= 0) {
+      push(@txdump, $threshold_tx_units[$count] . " >= " . $thresholds_tx[$count]);
+    }
+  }
+  nprint("RX Thresholds: " . join(", ", @rxdump));
+  nprint("TX Thresholds: " . join(", ", @txdump));
+
+  my $linecount = 0;
+
+  sleep($interval);
+  while(1) {
+    my $nstats = get_stats();
+    if(!defined($nstats)) {
+      nprint("FATAL: failed to get updated interface stats");
+      exit;
+    }
+    window_add($nstats);
+
+    #if(scalar(@stats) < $window_size) {
+    #  sleep($interval);
+    #  next;
+    #}
+
+    # make output to stdout a little easier to read
+    if(!defined($syslog) && $linecount > 1) {
+      nprint_ratelimit("dash", "-----");
+    }
+    $linecount = 0;
+
+    my $ostats = @stats[0];
+    for my $int (sort keys %$nstats) {
+      next if($int !~ /^$intreg$/);
+
+      # wtf: new interface we never seen before?
+      next if(!defined($stats->{$int}));
+
+      my ($rxline, $txline);
+      for(my $thresh; $thresh <= INDEX_MAX; $thresh++) {
+        # rx data
+        if(defined($thresholds_rx[$thresh]) && $thresholds_rx[$thresh] >= 0) {
+
+          my $diff = delta($nstats->{$int}->{rx}[$thresh], $ostats->{$int}->{rx}[$thresh]);
+          if($threshold_avg[$thresh]) {
+            $diff = $diff / ($interval * (scalar(@stats) - 1));
+          }
+          $diff = $diff * $threshold_convert[$thresh];
+
+          # only care if its greater then the threshold
+          if($diff >= $thresholds_rx[$thresh]) {
+            $rxline .= sprintf("$threshold_formats[$thresh] $threshold_rx_units[$thresh] ", $diff);
+          }
+        }
+
+        # tx data
+        if(defined($thresholds_tx[$thresh]) && $thresholds_tx[$thresh] >= 0) {
+
+          my $diff = delta($nstats->{$int}->{tx}[$thresh], $ostats->{$int}->{tx}[$thresh]);
+          if($threshold_avg[$thresh]) {
+            $diff = $diff / ($interval * (scalar(@stats) - 1));
+          } 
+          $diff = $diff * $threshold_convert[$thresh];
+
+          # only care if its greater then the threshold
+          if($diff >= $thresholds_tx[$thresh]) {
+            $txline .= sprintf("$threshold_formats[$thresh] $threshold_tx_units[$thresh] ", $diff);
+          }
+        }
+      }
+
+      # some ugly to build the printable line
+      if(defined($rxline) || defined($txline)) {
+        my $line = sprintf("%-5s ", $int);
+        if(defined($rxline)) {
+          $line .= "RX: $rxline";
+        }
+        if(defined($txline)) {
+          if(defined($rxline)) {
+            $line .= "| ";
+          }
+          $line .= "TX: $txline";
+        }
+        nprint_ratelimit($int, $line);
+        $linecount++;
+      }
+    }
+    sleep($interval);
+  }
+}
+
+# add a new entry to the window, removing the oldest if needed.
+sub window_add {
+  my $data = shift;
+
+  push(@stats, $data);
+
+  if(scalar(@stats) > $window_size + 1) {
+    shift(@stats);
+  }
+}
+
+sub delta {
+  my ($new, $old)  = @_;
+
+  my $diff;
+  # deal with 32bit roll over
+  if($new < $old) {
+     $diff = (0xFFFFFFFF - $old) + $new;
+  } else {
+     $diff = $new - $old;
+  }
+  return $diff;
+}
+
+# grab data from 
+sub get_stats {
+  unless(open(STATS, "/proc/net/dev")) {
+    nprint("ERROR: unable to open /proc/net/dev: $!");
+    return;
+  }
+  my @lines = <STATS>;
+  close(STATS);
+
+  my $data;
+  for my $line (@lines) {
+    my ($int,$stats) = split(":",$line);
+
+    # skip the bogus header lines
+    next if(!defined($stats));
+
+    $int =~ s/\ //g;
+    $stats =~ s/^\s+//;
+    my @fields = split(/\s+/,$stats);
+    push(@{$data->{$int}->{rx}}, (@fields)[0,1,2,3,4,5,6,7]);
+    push(@{$data->{$int}->{tx}}, (@fields)[8,9,10,11,12,13,14,15]);
+  }
+  return $data;
+}
+
+# return a regex that will match all interfaces (minus lo) that have seen 
+# packets
+sub guess_intreg {
+  my $stats = shift;
+
+  my @ints;
+  for my $int (keys %$stats) {
+    next if($int eq "lo");
+
+    if($stats->{$int}->{rx}[INDEX_RX_PACKETS] > 0 
+    || $stats->{$int}->{tx}[INDEX_TX_PACKETS] > 0) {
+      push(@ints, $int);
+    }
+  }
+
+  if(scalar(@ints) == 0) {
+    return "eth0";
+  }
+
+  return "(" . join("|", sort(@ints)) . ")";
+}
+
+sub nprint {
+  my $msg = join(" ", @_);
+
+  if(defined($syslog)) {
+    setlogsock( "unix" );
+    openlog("nrate", "cons, pid", "user");
+    syslog("info", "%s", $msg);
+  } else {
+    my ($sec, $min, $hour) = (localtime(time()))[0,1,2];
+    printf("%.2d:%.2d.%.2d %s\n", $hour, $min, $sec, $msg);
+  }
+}
+
+# this message is subject to ratelimiting if it's going to syslog
+sub nprint_ratelimit {
+  my $int = shift;
+
+  if(defined($lograte)) {
+
+    # deal with time going backwards
+    if(defined($lastlog->{$int}) && $lastlog->{$int} > time()) {
+      delete($lastlog->{$int});
+    }
+
+    if($lastlog->{$int} + $lograte < time()) {
+      nprint(@_);
+      $lastlog->{$int} = time();
+    }
+
+  } else {
+    nprint(@_);
+  }
+}
+
+sub check_pid {
+  my $pidfile = shift;
+
+  if(-f $pidfile) {
+    my $oldpid;
+    unless(open(PID, $pidfile)) {
+      nprint("FATAL: Unable to open pid file ($pidfile): $!");
+      exit;
+    }
+    chomp(my $oldpid = <PID>);
+    close(PID);
+
+    if($oldpid !~ /^\d+$/) {
+      nprint("Bogus pid in pidfile, Removing.");
+      unlink($pidfile);
+      return;
+    }
+    if(-d "/proc/$oldpid") {
+      if(open(CMDLINE, "/proc/$oldpid/cmdline")) {
+        my $cmdline = <CMDLINE>;
+        close(CMDLINE);
+        if($cmdline !~ /nrate/) {
+          nprint("Stale pidfile found.  Removing.");
+          unlink($pidfile);
+        }
+      }
+
+      # process is running, just exit quietly
+      nprint("Process is already running?");
+      exit();
+    } else {
+      nprint("Stale pidfile found.  Removing.");
+      unlink($pidfile);
+    }
+  }
+}
+
+sub write_pid {
+  my $pidfile = shift;
+
+  unless(open(PID, ">$pidfile")) {
+    nprint("FATAL: Unable to open pidfile ($pidfile): $!");
+    exit;
+  }
+  print PID $$ . "\n";
+  close(PID);
+}
+
+sub usage {
+print <<USAGE;
+
+nrate [options]
+  Monitors network stats on a host by watching /proc/net/dev
+
+  Options:
+    --interval|-t <n>    : change the interval time [default: 5]
+    --interface|-i <r>   : regex of interface(s) to watch [default: all active]
+    --window-size|-i <n> : use a sliding window of size <n> when calculating
+                           stats [default: 1]
+    --syslog:s           : send output to syslog
+    --log-rate|-l <n>    : rate limit output to 1 message per interface per <n> 
+                           seconds [default: disabled]
+    --daemonize|D        : daemonize, requires --syslog [default: disabled]
+    --pid-file|p <pid>   : override the default pid file with daemonizing
+                           [default: /var/run/nrate/nrate.pid]
+
+  Threshold Options:
+    nrate will monitor all stats for a given interface, but only output data 
+    for a specific stat if the stat increases by >= the defined threshold 
+    over the sample interval.  A threshold of 0 will cause the stat to 
+    print every interval, while a threshold of -1 will disable the stat 
+    from ever printing.
+
+    Receive Thresholds
+    ------------------
+    --rx-mbits <n>       : Mbit/s (average over interval) [default: 0]
+    --rx-kpps <n>        : Kilo Packets/s (average over interval) [default 0]
+    --rx-errors <n>      : Interface Errors (interval difference) [default: 1]
+    --rx-drops <n>       : Interface Drops (interval difference) [default: 1]
+    --rx-fifo <n>        : FIFO Buffer Errors (interval difference) [default: 1]
+    --rx-frame <n>       : Frame Errors (interval difference) [default: 1]
+    --rx-compressed <n>  : Compressed Packets (interval difference) [default: -1]
+    --rx-multicast <n>   : Multicast Packets (interval difference) [default: -1]
+
+    Transmit Thresholds
+    -------------------
+    --tx-mbits <n>       : Mbit/s (average over interval) [default: 0]
+    --tx-kpps <n>        : Kilo Packets/s (average over interval) [default 0]
+    --tx-errors <n>      : Interface Errors (interval difference) [default: 1]
+    --tx-drops <n>       : Interface Drops (interval difference) [default: 1]
+    --tx-fifo <n>        : FIFO Buffer Errors (interval difference) [default: 1]
+    --tx-colls <n>       : Packet Collisions (interval difference) [default: 1]
+    --tx-carrier <n>     : Lost Carriers (interval difference) [default: 1]
+    --tx-compressed <n>  : Compressed Packets (interval difference) [default: -1]
+   
+  Examples:
+    nrate -i eth0 --rx-mbits=50 --tx-mbits=50 --rx-pps=-1 --tx-pps=-1
+      Print to stdout anytime eth0 goes above 50mbit/s over the default 
+      interval (5 seconds) and default window size (1).
+
+    nrate -i eth0 -t 2 -w 5
+      Take samples and print data every 2 seconds.  Printed data will be based on
+      the current sample and the one taken 10 seconds ago.  ie: A sliding average
+      for the last 10 seconds.
+
+    nrate -i eth0 --rx-mbits=50 --tx-mbits=50 --rx-pps=-1 --tx-pps=-1 -s --log-rate 30
+      Same as the previous example except output goes to syslog and is 
+      rate limited to 1 message per 30 seconds.
+
+USAGE
+
+} 
